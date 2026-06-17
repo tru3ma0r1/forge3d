@@ -1,12 +1,13 @@
 // Forge3D — AI API wrapper
-// Uses Hugging Face Spaces via Gradio API
+// Uses Hugging Face Spaces Gradio API v4 pattern:
+// POST /gradio_api/call/{fn} → get event_id → GET /gradio_api/call/{fn}/{event_id}
 
 export const MODELS = {
   trellis: {
     id: 'trellis',
     name: 'TRELLIS',
     label: 'TRELLIS.2 (Microsoft)',
-    desc: 'Best for production-grade PBR assets. MIT licensed.',
+    desc: 'Image → 3D with full PBR materials. MIT licensed.',
     badge: 'BEST QUALITY',
     color: '#2dd4bf',
     spaceUrl: 'https://microsoft-trellis-2.hf.space',
@@ -31,217 +32,197 @@ export const MODELS = {
   }
 }
 
-// Helper: call a Gradio Space API
-async function gradioCall(spaceUrl, apiName, data, hfToken) {
+// Gradio v4 API: POST to get event_id, then poll GET for result
+async function gradioPredict(spaceUrl, fnName, data, hfToken, onProgress) {
   const headers = {
     'Content-Type': 'application/json',
     ...(hfToken ? { Authorization: `Bearer ${hfToken}` } : {})
   }
 
-  // First get the session hash
-  const sessionRes = await fetch(`${spaceUrl}/queue/join`, {
+  // Step 1: Submit job
+  const submitRes = await fetch(`${spaceUrl}/gradio_api/call/${fnName}`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ data, fn_index: 0, session_hash: Math.random().toString(36).slice(2) })
+    body: JSON.stringify({ data })
   })
 
-  if (!sessionRes.ok) {
-    // Fall back to direct predict
-    const res = await fetch(`${spaceUrl}/api/predict`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ data, fn_index: 0 })
-    })
-    if (!res.ok) {
-      const text = await res.text()
-      throw new Error(`API error ${res.status}: ${text.slice(0, 200)}`)
+  if (!submitRes.ok) {
+    const text = await submitRes.text()
+    throw new Error(`Submit error ${submitRes.status}: ${text.slice(0, 300)}`)
+  }
+
+  const { event_id } = await submitRes.json()
+  if (!event_id) throw new Error('No event_id returned from Space')
+
+  onProgress?.('Waiting in queue…')
+
+  // Step 2: Poll for result via SSE
+  const resultRes = await fetch(`${spaceUrl}/gradio_api/call/${fnName}/${event_id}`, {
+    headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : {}
+  })
+
+  if (!resultRes.ok) {
+    const text = await resultRes.text()
+    throw new Error(`Poll error ${resultRes.status}: ${text.slice(0, 300)}`)
+  }
+
+  // Read SSE stream
+  const text = await resultRes.text()
+  const lines = text.split('\n')
+
+  for (const line of lines) {
+    if (line.startsWith('data: ')) {
+      const json = line.slice(6).trim()
+      if (!json || json === '[DONE]') continue
+      try {
+        const parsed = JSON.parse(json)
+        if (Array.isArray(parsed)) return { data: parsed }
+        if (parsed.error) throw new Error(`Space error: ${parsed.error}`)
+      } catch (e) {
+        if (e.message.startsWith('Space error:')) throw e
+      }
     }
-    return await res.json()
   }
 
-  return await sessionRes.json()
+  throw new Error('No result data received from Space')
 }
 
-// TRELLIS — image to 3D (primary mode, text needs image input)
-export async function generateWithTrellis({ prompt, imageBase64, hfToken }) {
-  const spaceUrl = 'https://microsoft-trellis-2.hf.space'
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(hfToken ? { Authorization: `Bearer ${hfToken}` } : {})
-  }
-
-  // TRELLIS.2 works best with image input
-  // For text-only, we'll use a placeholder approach via the /run/predict endpoint
-  const payload = imageBase64
-    ? {
-        data: [
-          { path: `data:image/png;base64,${imageBase64}` },
-          [],    // multiimages
-          0,     // seed
-          12,    // ss_sampling_steps
-          7.5,   // ss_guidance_strength
-          12,    // slat_sampling_steps
-          3,     // slat_guidance_strength
-          'stochastic' // multiimage_algo
-        ],
-        fn_index: 0,
-      }
-    : {
-        data: [
-          prompt,
-          0,     // seed
-          12,    // steps
-          7.5,   // guidance
-        ],
-        fn_index: 1,
-      }
-
-  const res = await fetch(`${spaceUrl}/run/predict`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload)
-  })
-
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`TRELLIS error: ${res.status} — ${text.slice(0, 300)}`)
-  }
-
-  const data = await res.json()
-  return extractModelUrl(data, spaceUrl)
-}
-
-// Hunyuan3D
-export async function generateWithHunyuan({ prompt, imageBase64, hfToken }) {
-  const spaceUrl = 'https://tencent-hunyuan3d-2.hf.space'
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(hfToken ? { Authorization: `Bearer ${hfToken}` } : {})
-  }
-
-  const payload = imageBase64
-    ? {
-        data: [
-          { path: `data:image/png;base64,${imageBase64}` },
-          true,  // remove_background
-          5,     // guidance_scale
-          30,    // num_inference_steps
-        ],
-        fn_index: 1,
-      }
-    : {
-        data: [
-          prompt,
-          true,
-          5,
-          30,
-          'png'
-        ],
-        fn_index: 0,
-      }
-
-  const res = await fetch(`${spaceUrl}/run/predict`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload)
-  })
-
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`Hunyuan3D error: ${res.status} — ${text.slice(0, 300)}`)
-  }
-
-  const data = await res.json()
-  return extractModelUrl(data, spaceUrl)
-}
-
-// Extract GLB/OBJ URL from Gradio response
+// Extract model URL from Gradio response
 function extractModelUrl(data, spaceUrl) {
-  if (!data?.data) return null
+  if (!data?.data) throw new Error('No data in response')
 
-  const flat = data.data.flat(Infinity)
+  const flat = JSON.parse(JSON.stringify(data.data))
 
-  for (const item of flat) {
-    if (typeof item === 'string') {
-      if (item.endsWith('.glb') || item.endsWith('.obj') || item.endsWith('.ply')) {
-        // If it's a relative path, prepend the space URL
-        if (item.startsWith('/')) return `${spaceUrl}${item}`
-        if (item.startsWith('http')) return item
-        return `${spaceUrl}/file=${item}`
+  function search(obj) {
+    if (typeof obj === 'string') {
+      if (obj.match(/\.(glb|obj|ply)(\?|$)/i)) {
+        if (obj.startsWith('http')) return obj
+        if (obj.startsWith('/')) return `${spaceUrl}${obj}`
+        return `${spaceUrl}/gradio_api/file=${obj}`
       }
     }
-    if (typeof item === 'object' && item !== null) {
-      const path = item.path || item.url || item.value
-      if (typeof path === 'string' && (path.endsWith('.glb') || path.endsWith('.obj'))) {
-        if (path.startsWith('/')) return `${spaceUrl}${path}`
-        if (path.startsWith('http')) return path
-        return `${spaceUrl}/file=${path}`
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const result = search(item)
+        if (result) return result
       }
     }
+    if (obj && typeof obj === 'object') {
+      for (const val of Object.values(obj)) {
+        const result = search(val)
+        if (result) return result
+      }
+    }
+    return null
   }
 
-  console.log('Full API response (for debugging):', JSON.stringify(data, null, 2))
-  throw new Error('Model generated but could not extract download URL. Check browser console for the raw response.')
+  const url = search(flat)
+
+  if (!url) {
+    console.log('Full API response:', JSON.stringify(data, null, 2))
+    throw new Error('Model generated but GLB URL not found. Check the browser console (F12) for the raw response to help debug.')
+  }
+
+  return url
+}
+
+// TRELLIS.2 — image to 3D
+export async function generateWithTrellis({ prompt, imageBase64, hfToken, onProgress }) {
+  const spaceUrl = 'https://microsoft-trellis-2.hf.space'
+
+  // TRELLIS.2 is image-to-3D only
+  // For text prompts, we still need an image — inform user
+  if (!imageBase64) {
+    throw new Error('TRELLIS works with images. Please switch to "Image to 3D" mode and upload a photo, or try Hunyuan3D for text prompts.')
+  }
+
+  onProgress?.('Sending image to TRELLIS.2…')
+
+  const data = await gradioPredict(
+    spaceUrl,
+    'image_to_3d',
+    [
+      { path: `data:image/png;base64,${imageBase64}` },
+      [],       // multiimages
+      0,        // seed
+      12,       // ss_sampling_steps
+      7.5,      // ss_guidance_strength
+      12,       // slat_sampling_steps
+      3,        // slat_guidance_strength
+      'stochastic' // multiimage_algo
+    ],
+    hfToken,
+    onProgress
+  )
+
+  return extractModelUrl(data, spaceUrl)
+}
+
+// Hunyuan3D 2.0 — text or image to 3D
+export async function generateWithHunyuan({ prompt, imageBase64, hfToken, onProgress }) {
+  const spaceUrl = 'https://tencent-hunyuan3d-2.hf.space'
+
+  onProgress?.('Sending to Hunyuan3D…')
+
+  const fnName = imageBase64 ? 'image_to_3d' : 'text_to_3d'
+  const data = imageBase64
+    ? await gradioPredict(spaceUrl, fnName, [
+        { path: `data:image/png;base64,${imageBase64}` },
+        true, 5, 30
+      ], hfToken, onProgress)
+    : await gradioPredict(spaceUrl, fnName, [
+        prompt, true, 5, 30, 'png'
+      ], hfToken, onProgress)
+
+  return extractModelUrl(data, spaceUrl)
 }
 
 // Meshy AI
-export async function generateWithMeshy({ prompt, imageUrl, meshyKey }) {
+export async function generateWithMeshy({ prompt, meshyKey, onProgress }) {
   if (!meshyKey) throw new Error('Meshy API key required. Get one free at meshy.ai')
 
-  const body = imageUrl
-    ? { image_url: imageUrl, enable_pbr: true }
-    : {
-        mode: 'preview',
-        prompt,
-        art_style: 'realistic',
-        negative_prompt: 'low quality, low resolution, low poly, ugly',
-        enable_pbr: true
-      }
+  onProgress?.('Sending to Meshy AI…')
 
-  const endpoint = imageUrl
-    ? 'https://api.meshy.ai/v1/image-to-3d'
-    : 'https://api.meshy.ai/v2/text-to-3d'
-
-  const res = await fetch(endpoint, {
+  const res = await fetch('https://api.meshy.ai/v2/text-to-3d', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${meshyKey}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      mode: 'preview',
+      prompt,
+      art_style: 'realistic',
+      negative_prompt: 'low quality, low poly, ugly',
+      enable_pbr: true
+    })
   })
 
   if (!res.ok) throw new Error(`Meshy error: ${res.status}`)
-  const data = await res.json()
-  return pollMeshyJob(data.result, meshyKey, !!imageUrl)
-}
-
-async function pollMeshyJob(taskId, meshyKey, isImage) {
-  const base = isImage
-    ? 'https://api.meshy.ai/v1/image-to-3d'
-    : 'https://api.meshy.ai/v2/text-to-3d'
+  const { result: taskId } = await res.json()
 
   for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 5000))
-    const res = await fetch(`${base}/${taskId}`, {
+    onProgress?.(`Meshy generating… (${(i + 1) * 5}s)`)
+    const poll = await fetch(`https://api.meshy.ai/v2/text-to-3d/${taskId}`, {
       headers: { Authorization: `Bearer ${meshyKey}` }
     })
-    const data = await res.json()
-    if (data.status === 'SUCCEEDED') return { data: [data.model_urls?.glb] }
+    const data = await poll.json()
+    if (data.status === 'SUCCEEDED') return data.model_urls?.glb
     if (data.status === 'FAILED') throw new Error('Meshy generation failed')
   }
-  throw new Error('Meshy timed out after 5 minutes')
+  throw new Error('Meshy timed out')
 }
 
 // Main dispatch
-export async function generate3D({ model, prompt, imageBase64, hfToken, meshyKey }) {
+export async function generate3D({ model, prompt, imageBase64, hfToken, meshyKey, onProgress }) {
   switch (model) {
     case 'trellis':
-      return generateWithTrellis({ prompt, imageBase64, hfToken })
+      return generateWithTrellis({ prompt, imageBase64, hfToken, onProgress })
     case 'hunyuan':
-      return generateWithHunyuan({ prompt, imageBase64, hfToken })
+      return generateWithHunyuan({ prompt, imageBase64, hfToken, onProgress })
     case 'meshy':
-      return generateWithMeshy({ prompt, meshyKey })
+      return generateWithMeshy({ prompt, meshyKey, onProgress })
     default:
       throw new Error(`Unknown model: ${model}`)
   }

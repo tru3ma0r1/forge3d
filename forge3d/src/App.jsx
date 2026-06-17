@@ -387,30 +387,18 @@ export default function App() {
         imageBase64,
         hfToken: apiKeys.hfToken,
         meshyKey: apiKeys.meshyKey,
+        onProgress: (msg) => setProgressMsg(msg),
       })
 
       clearInterval(tick)
       setProgress(95)
       setProgressMsg('Processing output…')
 
-      // Extract model URL from result
-      // Different models return different structures
-      let url = null
-      if (result?.data) {
-        // Gradio response — look for GLB file path
-        const files = result.data.flat(Infinity)
-        const glb = files.find(f => typeof f === 'string' && (f.includes('.glb') || f.includes('.obj')))
-        url = glb
-      } else if (result?.model_urls?.glb) {
-        url = result.model_urls.glb
-      } else if (result?.model_url) {
-        url = result.model_url
-      }
+      // generate3D now returns a URL string directly
+      const url = result
 
       if (!url) {
-        // For demo: show raw result info
-        console.log('Raw result:', result)
-        throw new Error('Model generated but URL extraction needs tuning for this model version. Check console for raw output.')
+        throw new Error('Model generated but URL could not be extracted. Check browser console (F12) for details.')
       }
 
       setProgress(100)
