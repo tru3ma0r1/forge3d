@@ -5,9 +5,9 @@
 const HF_API = 'https://api-inference.huggingface.co'
 
 // TRELLIS Space endpoint (runs on HF Spaces — free, no GPU needed locally)
-const TRELLIS_SPACE = 'https://JeffreyXiang-TRELLIS.hf.space'
+const TRELLIS_SPACE = 'https://jeffreyxiang-trellis.hf.space'
 // Hunyuan3D Space endpoint
-const HUNYUAN_SPACE = 'https://tencent-Hunyuan3D-2.hf.space'
+const HUNYUAN_SPACE = 'https://tencent-hunyuan3d-2.hf.space'
 
 export const MODELS = {
   trellis: {
